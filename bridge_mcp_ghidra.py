@@ -137,6 +137,42 @@ def search_functions_by_name(query: str, offset: int = 0, limit: int = 100) -> l
     return safe_get("searchFunctions", {"query": query, "offset": offset, "limit": limit})
 
 @mcp.tool()
+def search_scalars(value: str, offset: int = 0, limit: int = 100) -> list:
+    """
+    Search numeric constants.
+    GET /searchScalars?value=0x35
+    Found 95 occurrences of scalar 0x35:
+    0000c47a: addi 0x35,sp,r6  [in FUN_0000c428]
+    0000c61e: st.b r11,0x35[sp]  [in FUN_0000c5b2]
+    0000c67e: addi 0x35,sp,r6  [in FUN_0000c62e]
+    0000c7ae: st.b r27,0x35[sp]  [in FUN_0000c758]
+    0001f2ee: movea 0x35,r0,r6  [in FUN_0001f20a]
+    00020308: addi 0x35,r29,r7  [in FUN_000202c6]
+    000234c2: sst.b 0x35[ep],r15  [in FUN_0002340c]
+    """
+    if not value:
+        return ["Error: value string is required"]
+    return safe_get("searchScalars", {"value": value, "offset": offset, "limit": limit})
+
+@mcp.tool()
+def search_memory_by_pattern(pattern: str, offset: int = 0, limit: int = 100) -> list:
+    """
+    Search numeric constants.
+    GET /searchMemory?pattern=00019100
+    Found 7 occurrences of pattern 00019100:
+    000c1bc3 [LE]: bytes: 00 91 01 00 08 04 00 00
+    000c2fc7 [LE]: bytes: 00 91 01 00 08 04 00 00
+    000c733c [LE]: data: 00019100 (void *)
+    001112bb [LE]: bytes: 00 91 01 00 02 FF 00 92
+    0011267d [LE]: bytes: 00 91 01 00 02 FF 00 92
+    00117e07 [LE]: bytes: 00 91 01 00 00 03 00 92
+    00118ccb [LE]: bytes: 00 91 01 00 00 03 00 92%
+    """
+    if not pattern:
+        return ["Error: pattern string is required"]
+    return safe_get("searchScalars", {"pattern": pattern, "offset": offset, "limit": limit})
+
+@mcp.tool()
 def rename_variable(function_name: str, old_name: str, new_name: str) -> str:
     """
     Rename a local variable within a function.
@@ -216,6 +252,20 @@ def set_function_prototype(function_address: str, prototype: str) -> str:
     Set a function's prototype.
     """
     return safe_post("set_function_prototype", {"function_address": function_address, "prototype": prototype})
+
+@mcp.tool()
+def set_data_type(address: str, new_type: str) -> str:
+    """
+    Set the data type at a specific address.
+    
+    Args:
+        address: The address in hex format (e.g., "0x0000d770")
+        new_type: The data type name (e.g., "int", "char *", "DWORD")
+    """
+    return safe_post("set_global_data_type", {
+        "address": address,
+        "new_type": new_type
+    })
 
 @mcp.tool()
 def set_local_variable_type(function_address: str, variable_name: str, new_type: str) -> str:

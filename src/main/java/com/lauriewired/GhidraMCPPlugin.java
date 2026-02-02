@@ -58,6 +58,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.BuiltInDataTypeManager;
+
 @PluginInfo(
     status = PluginStatus.RELEASED,
     packageName = ghidra.app.DeveloperPluginPackage.NAME,
@@ -191,6 +195,22 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, searchFunctionsByName(searchTerm, offset, limit));
         });
 
+        server.createContext("/searchScalars", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String scalarValue = qparams.get("value");
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchScalars(scalarValue, offset, limit));
+        });
+
+        server.createContext("/searchMemory", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String hexPattern = qparams.get("pattern");
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchMemoryHex(hexPattern, offset, limit));
+        });
+
         // New API endpoints based on requirements
         
         server.createContext("/get_function_by_address", exchange -> {
@@ -265,6 +285,45 @@ public class GhidraMCPPlugin extends Plugin {
             } else {
                 // Return the detailed error message to the client
                 sendResponse(exchange, "Failed to set function prototype: " + result.getErrorMessage());
+            }
+        });
+
+        server.createContext("/set_global_data_type", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String newType = params.get("new_type");
+
+           // Capture detailed information about setting the type
+            StringBuilder responseMsg = new StringBuilder();
+            responseMsg.append("Setting variable type: ").append(newType)
+                      .append(" at ").append(address).append("\n\n");
+
+            // Attempt to find the data type in various categories
+            Program program = getCurrentProgram();
+
+            if (program != null) {
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType directType = findDataTypeByNameInAllCategories(dtm, newType);
+                if (directType != null) {
+                    responseMsg.append("Found type: ").append(directType.getPathName()).append("\n");
+                } else if (newType.startsWith("P") && newType.length() > 1) {
+                    String baseTypeName = newType.substring(1);
+                    DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
+                    if (baseType != null) {
+                        responseMsg.append("Found base type for pointer: ").append(baseType.getPathName()).append("\n");
+                    } else {
+                        responseMsg.append("Base type not found for pointer: ").append(baseTypeName).append("\n");
+                    }
+                } else {
+                    responseMsg.append("Type not found directly: ").append(newType).append("\n");
+                }
+            }
+
+            boolean result = setDataTypeAtAddress(address, newType);
+            if (result) {
+                sendResponse(exchange, responseMsg + "Data type set successfully");
+            } else {
+                sendResponse(exchange, responseMsg + "Failed to set data type");
             }
         });
 
@@ -485,6 +544,260 @@ public class GhidraMCPPlugin extends Plugin {
         }
         return paginateList(matches, offset, limit);
     }    
+
+/**
+     * Search for scalar (constant) values in instructions throughout the program.
+     * Scalars are numeric constants used as operands in instructions.
+     * 
+     * @param scalarValueStr The scalar value to search for (decimal or hex with 0x prefix)
+     * @param offset Pagination offset
+     * @param limit Maximum number of results to return
+     * @return Formatted string of locations where the scalar is found
+     */
+    private String searchScalars(String scalarValueStr, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (scalarValueStr == null || scalarValueStr.isEmpty()) return "Scalar value is required";
+
+        long scalarValue;
+        try {
+            // Support both decimal and hex (0x prefix) formats
+            if (scalarValueStr.toLowerCase().startsWith("0x")) {
+                scalarValue = Long.parseUnsignedLong(scalarValueStr.substring(2), 16);
+            } else {
+                scalarValue = Long.parseLong(scalarValueStr);
+            }
+        } catch (NumberFormatException e) {
+            return "Invalid scalar value: " + scalarValueStr + ". Use decimal or hex (0x) format.";
+        }
+
+        List<String> matches = new ArrayList<>();
+        Listing listing = program.getListing();
+        InstructionIterator instructions = listing.getInstructions(true);
+
+        while (instructions.hasNext()) {
+            Instruction instr = instructions.next();
+            
+            // Check each operand for scalar values
+            int numOperands = instr.getNumOperands();
+            for (int i = 0; i < numOperands; i++) {
+                // Get scalar from operand if present
+                ghidra.program.model.scalar.Scalar scalar = instr.getScalar(i);
+                if (scalar != null) {
+                    // Check both signed and unsigned values
+                    if (scalar.getValue() == scalarValue || scalar.getUnsignedValue() == scalarValue) {
+                        // Get containing function if available
+                        Function func = program.getFunctionManager().getFunctionContaining(instr.getAddress());
+                        String funcName = (func != null) ? func.getName() : "<no function>";
+                        
+                        matches.add(String.format("%s: %s  [in %s]",
+                            instr.getAddress(),
+                            instr.toString(),
+                            funcName));
+                    }
+                }
+            }
+        }
+
+        if (matches.isEmpty()) {
+            return "No instructions found containing scalar value: " + scalarValueStr;
+        }
+
+        return String.format("Found %d occurrences of scalar %s:\n%s", 
+            matches.size(), 
+            scalarValueStr,
+            paginateList(matches, offset, limit));
+    }    
+
+   /**
+     * Search memory for a hex byte pattern.
+     * Useful for finding function tables, data references not captured by xrefs, etc.
+     * 
+     * @param hexPattern Hex string to search for. Formats supported:
+     *                   - Address format: "00019100" (will be converted to little-endian bytes)
+     *                   - Raw bytes: "00 91 01 00" or "00910100"
+     *                   - With 0x prefix: "0x00019100"
+     * @param offset Pagination offset
+     * @param limit Maximum number of results to return
+     * @return Formatted string of memory locations where the pattern is found
+     */
+    private String searchMemoryHex(String hexPattern, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (hexPattern == null || hexPattern.isEmpty()) return "Hex pattern is required";
+
+        // Clean up the hex pattern - remove spaces, 0x prefix
+        String cleanedPattern = hexPattern.trim()
+            .replaceAll("\\s+", "")
+            .replaceAll("^0[xX]", "");
+
+        // Validate hex string
+        if (!cleanedPattern.matches("[0-9a-fA-F]+")) {
+            return "Invalid hex pattern. Use format: '00019100', '0x00019100', or '00 91 01 00'";
+        }
+
+        // Ensure even number of hex digits
+        if (cleanedPattern.length() % 2 != 0) {
+            cleanedPattern = "0" + cleanedPattern;
+        }
+
+        // Convert hex string to byte array
+        byte[] searchBytes = hexStringToBytes(cleanedPattern);
+        if (searchBytes == null || searchBytes.length == 0) {
+            return "Failed to parse hex pattern";
+        }
+
+        // Also create little-endian version for address searches
+        byte[] searchBytesLE = reverseBytesArray(searchBytes);
+
+        List<String> matches = new ArrayList<>();
+        Memory memory = program.getMemory();
+
+        // Search through all memory blocks
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.isInitialized()) continue;
+
+            Address start = block.getStart();
+            Address end = block.getEnd();
+
+            // Search for big-endian pattern
+            Address found = searchInRange(memory, start, end, searchBytes);
+            while (found != null) {
+                matches.add(formatMemoryMatch(program, found, searchBytes, "BE"));
+                // Continue search after found address
+                Address nextStart = found.add(1);
+                if (nextStart.compareTo(end) <= 0) {
+                    found = searchInRange(memory, nextStart, end, searchBytes);
+                } else {
+                    break;
+                }
+            }
+
+            // Search for little-endian pattern (if different from BE)
+            if (!Arrays.equals(searchBytes, searchBytesLE)) {
+                found = searchInRange(memory, start, end, searchBytesLE);
+                while (found != null) {
+                    matches.add(formatMemoryMatch(program, found, searchBytesLE, "LE"));
+                    Address nextStart = found.add(1);
+                    if (nextStart.compareTo(end) <= 0) {
+                        found = searchInRange(memory, nextStart, end, searchBytesLE);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Remove duplicates and sort
+        List<String> uniqueMatches = new ArrayList<>(new LinkedHashSet<>(matches));
+        Collections.sort(uniqueMatches);
+
+        if (uniqueMatches.isEmpty()) {
+            return String.format("No matches found for pattern: %s\n" +
+                "Searched for bytes (BE): %s\n" +
+                "Searched for bytes (LE): %s",
+                hexPattern,
+                bytesToHexString(searchBytes),
+                bytesToHexString(searchBytesLE));
+        }
+
+        return String.format("Found %d occurrences of pattern %s:\n%s",
+            uniqueMatches.size(),
+            hexPattern,
+            paginateList(uniqueMatches, offset, limit));
+    }
+
+    /**
+     * Search for byte pattern in a memory range
+     */
+    private Address searchInRange(Memory memory, Address start, Address end, byte[] pattern) {
+        try {
+            return memory.findBytes(start, end, pattern, null, true, null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Format a memory match result with context information
+     */
+    private String formatMemoryMatch(Program program, Address addr, byte[] pattern, String endianness) {
+        StringBuilder result = new StringBuilder();
+        result.append(String.format("%s [%s]: ", addr, endianness));
+
+        // Check if this is in a function
+        Function func = program.getFunctionManager().getFunctionContaining(addr);
+        if (func != null) {
+            result.append(String.format("in function %s, ", func.getName()));
+        }
+
+        // Check what's at this address
+        Listing listing = program.getListing();
+        Data data = listing.getDataAt(addr);
+        if (data != null) {
+            result.append(String.format("data: %s (%s)", data.getDefaultValueRepresentation(), data.getDataType().getName()));
+        } else {
+            Instruction instr = listing.getInstructionAt(addr);
+            if (instr != null) {
+                result.append(String.format("instruction: %s", instr.toString()));
+            } else {
+                // Show raw bytes at location
+                result.append("bytes: ");
+                try {
+                    byte[] context = new byte[Math.min(8, pattern.length + 4)];
+                    program.getMemory().getBytes(addr, context);
+                    result.append(bytesToHexString(context));
+                } catch (Exception e) {
+                    result.append(bytesToHexString(pattern));
+                }
+            }
+        }
+
+        // Check for any labels/symbols at this address
+        Symbol[] symbols = program.getSymbolTable().getSymbols(addr);
+        if (symbols.length > 0) {
+            result.append(String.format(" [label: %s]", symbols[0].getName()));
+        }
+
+        return result.toString();
+    }
+
+    /**
+     * Convert hex string to byte array
+     */
+    private byte[] hexStringToBytes(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return data;
+    }
+
+    /**
+     * Reverse byte array (for endianness conversion)
+     */
+    private byte[] reverseBytesArray(byte[] bytes) {
+        byte[] reversed = new byte[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            reversed[i] = bytes[bytes.length - 1 - i];
+        }
+        return reversed;
+    }
+
+    /**
+     * Convert byte array to hex string for display
+     */
+    private String bytesToHexString(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < bytes.length; i++) {
+            if (i > 0) sb.append(" ");
+            sb.append(String.format("%02X", bytes[i] & 0xFF));
+        }
+        return sb.toString();
+    }
+
 
     // ----------------------------------------------------------------------------------
     // Logic for rename, decompile, etc.
@@ -918,6 +1231,65 @@ public class GhidraMCPPlugin extends Plugin {
         public String getErrorMessage() {
             return errorMessage;
         }
+    }
+
+    private void _setDataTypeAtAddress(String addressStr, String dataTypeName) {
+        Program program = getCurrentProgram();
+        int tx = program.startTransaction("Change Global Data Type");
+
+        Address addr = program.getAddressFactory().getAddress(addressStr);
+        DataTypeManager dtm = program.getDataTypeManager();
+        final StringBuilder errorMessage = new StringBuilder();
+
+        // Find the data type
+        
+        DataType dataType = resolveDataType(dtm, dataTypeName);
+        if (dataType == null) {
+            errorMessage.append("Could not find data type: " + dataTypeName);
+            return;
+        }
+        
+        // Clear existing data at address
+        Listing listing = program.getListing();
+        listing.clearCodeUnits(addr, addr.add(dataType.getLength() - 1), false);
+
+        AtomicBoolean success = new AtomicBoolean(false);
+
+        try {
+            listing.createData(addr, dataType);
+            success.set(true);
+        } catch (Exception e) {
+            errorMessage.append("Failed to create data: " + e.getMessage());
+        } finally {
+            program.endTransaction(tx, success.get());
+        }
+    }
+
+
+
+    private boolean setDataTypeAtAddress(String addressStr, String dataTypeName) {
+        Program program = getCurrentProgram();
+        if (program == null) {
+            return false;
+        }
+        if (addressStr == null || addressStr.isEmpty()) {
+            return false;
+        }
+        if (dataTypeName == null || dataTypeName.isEmpty()) {
+            return false;
+        }
+        
+        final StringBuilder errorMessage = new StringBuilder();
+        
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                _setDataTypeAtAddress(addressStr, dataTypeName);
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            errorMessage.append("Swing thread error: " + e.getMessage());
+        }
+        
+        return true;
     }
 
     /**
@@ -1420,78 +1792,74 @@ public class GhidraMCPPlugin extends Plugin {
      * @return The resolved DataType, or null if not found
      */
     private DataType resolveDataType(DataTypeManager dtm, String typeName) {
-        // First try to find exact match in all categories
-        DataType dataType = findDataTypeByNameInAllCategories(dtm, typeName);
-        if (dataType != null) {
-            Msg.info(this, "Found exact data type match: " + dataType.getPathName());
-            return dataType;
-        }
-
-        // Check for Windows-style pointer types (PXXX)
-        if (typeName.startsWith("P") && typeName.length() > 1) {
-            String baseTypeName = typeName.substring(1);
-
-            // Special case for PVOID
-            if (baseTypeName.equals("VOID")) {
-                return new PointerDataType(dtm.getDataType("/void"));
-            }
-
-            // Try to find the base type
-            DataType baseType = findDataTypeByNameInAllCategories(dtm, baseTypeName);
+        String trimmed = typeName.trim();
+        
+        // Handle pointer types (e.g., "void *", "int*", "char *")
+        if (trimmed.endsWith("*")) {
+            String baseTypeName = trimmed.substring(0, trimmed.length() - 1).trim();
+            DataType baseType = findBaseType(baseTypeName);
             if (baseType != null) {
-                return new PointerDataType(baseType);
+                return dtm.getPointer(baseType);
             }
-
-            Msg.warn(this, "Base type not found for " + typeName + ", defaulting to void*");
-            return new PointerDataType(dtm.getDataType("/void"));
+            return null;
         }
-
-        // Handle common built-in types
-        switch (typeName.toLowerCase()) {
-            case "int":
-            case "long":
-                return dtm.getDataType("/int");
-            case "uint":
-            case "unsigned int":
-            case "unsigned long":
-            case "dword":
-                return dtm.getDataType("/uint");
-            case "short":
-                return dtm.getDataType("/short");
-            case "ushort":
-            case "unsigned short":
-            case "word":
-                return dtm.getDataType("/ushort");
-            case "char":
-            case "byte":
-                return dtm.getDataType("/char");
-            case "uchar":
-            case "unsigned char":
-                return dtm.getDataType("/uchar");
-            case "longlong":
-            case "__int64":
-                return dtm.getDataType("/longlong");
-            case "ulonglong":
-            case "unsigned __int64":
-                return dtm.getDataType("/ulonglong");
-            case "bool":
-            case "boolean":
-                return dtm.getDataType("/bool");
-            case "void":
-                return dtm.getDataType("/void");
-            default:
-                // Try as a direct path
-                DataType directType = dtm.getDataType("/" + typeName);
-                if (directType != null) {
-                    return directType;
+        
+        // Handle array types (e.g., "int[10]", "char[256]")
+        if (trimmed.contains("[") && trimmed.endsWith("]")) {
+            int bracketStart = trimmed.indexOf('[');
+            String baseTypeName = trimmed.substring(0, bracketStart).trim();
+            String sizeStr = trimmed.substring(bracketStart + 1, trimmed.length() - 1).trim();
+            
+            DataType baseType = findBaseType(baseTypeName);
+            if (baseType != null) {
+                try {
+                    int size = Integer.parseInt(sizeStr);
+                    return new ArrayDataType(baseType, size, baseType.getLength());
+                } catch (NumberFormatException e) {
+                    Msg.error(this, "Invalid array size: "  + sizeStr, e);
                 }
-
-                // Fallback to int if we couldn't find it
-                Msg.warn(this, "Unknown type: " + typeName + ", defaulting to int");
-                return dtm.getDataType("/int");
+            }
+            return null;
         }
+        
+        // Regular type lookup
+        return findBaseType(trimmed);
     }
     
+    private DataType findBaseType(String typeName) {
+        DataTypeManager dtm = getCurrentProgram().getDataTypeManager();
+        
+        // Handle "void" specially
+        if (typeName.equalsIgnoreCase("void")) {
+            return DataType.VOID;
+        }
+        
+        // Try direct path lookup
+        DataType dt = dtm.getDataType("/" + typeName);
+        if (dt != null) return dt;
+        
+        // Search in program's data type manager
+        Iterator<DataType> iter = dtm.getAllDataTypes();
+        while (iter.hasNext()) {
+            DataType dataType = iter.next();
+            if (dataType.getName().equalsIgnoreCase(typeName)) {
+                return dataType;
+            }
+        }
+        
+        // Search built-in types
+        BuiltInDataTypeManager builtIn = BuiltInDataTypeManager.getDataTypeManager();
+        Iterator<DataType> builtInIter = builtIn.getAllDataTypes();
+        while (builtInIter.hasNext()) {
+            DataType dataType = builtInIter.next();
+            if (dataType.getName().equalsIgnoreCase(typeName)) {
+                return dataType;
+            }
+        }
+        
+        return null;
+    }
+
     /**
      * Find a data type by name in all categories/folders of the data type manager
      * This searches through all categories rather than just the root
