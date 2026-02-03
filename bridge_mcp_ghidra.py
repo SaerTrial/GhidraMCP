@@ -170,7 +170,30 @@ def search_memory_by_pattern(pattern: str, offset: int = 0, limit: int = 100) ->
     """
     if not pattern:
         return ["Error: pattern string is required"]
-    return safe_get("searchScalars", {"pattern": pattern, "offset": offset, "limit": limit})
+    return safe_get("searchMemory", {"pattern": pattern, "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def read_memory(address: str, length: int = 16) -> list:
+    """
+    Read memory in a range.
+    GET /readMemory?address=0x000c735b&length=16
+    Memory dump from 000c735b (16 bytes):
+
+
+    000c735b:  00 CB C3 00 00 00 00 00  00 00 00 00 00 CC C3 00  |................|
+
+    --- Interpretation ---
+    As pointers (LE):
+    000c735b: 0x00C3CB00
+    000c735f: 0x00000000
+    000c7363: 0x00000000
+    000c7367: 0x00C3CC00
+    """
+    if not address:
+        return ["Error: address string is required"]
+    return safe_get("readMemory", {"address": address, "length": str(length)})
+
 
 @mcp.tool()
 def rename_variable(function_name: str, old_name: str, new_name: str) -> str:

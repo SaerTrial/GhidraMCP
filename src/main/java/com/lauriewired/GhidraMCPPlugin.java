@@ -211,6 +211,13 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, searchMemoryHex(hexPattern, offset, limit));
         });
 
+        server.createContext("/readMemory", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            int length = parseIntOrDefault(qparams.get("length"), 16);
+            sendResponse(exchange, readMemoryRange(address, length));
+        });
+
         // New API endpoints based on requirements
         
         server.createContext("/get_function_by_address", exchange -> {
@@ -798,6 +805,139 @@ public class GhidraMCPPlugin extends Plugin {
         return sb.toString();
     }
 
+   /**
+     * Read a range of memory bytes from a specified address.
+     * Returns hex dump with ASCII representation.
+     * 
+     * @param addressStr Starting address (hex with optional 0x prefix)
+     * @param length Number of bytes to read (default 16, max 4096)
+     * @return Formatted hex dump of the memory range
+     */
+    private String readMemoryRange(String addressStr, int length) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        // Limit length to prevent huge responses
+        int maxLength = 4096;
+        if (length <= 0) length = 16;
+        if (length > maxLength) length = maxLength;
+
+        try {
+            Address startAddr = program.getAddressFactory().getAddress(addressStr);
+            if (startAddr == null) {
+                return "Invalid address: " + addressStr;
+            }
+
+            ghidra.program.model.mem.Memory memory = program.getMemory();
+            
+            // Check if address is in valid memory
+            if (!memory.contains(startAddr)) {
+                return "Address " + addressStr + " is not in valid memory";
+            }
+
+            // Read the bytes
+            byte[] bytes = new byte[length];
+            int bytesRead = memory.getBytes(startAddr, bytes, 0, length);
+            
+            if (bytesRead <= 0) {
+                return "Could not read memory at " + addressStr;
+            }
+
+            // Format as hex dump
+            StringBuilder result = new StringBuilder();
+            result.append(String.format("Memory dump from %s (%d bytes):\n\n", startAddr, bytesRead));
+
+            // Add context info
+            Function func = program.getFunctionManager().getFunctionContaining(startAddr);
+            if (func != null) {
+                result.append(String.format("In function: %s\n", func.getName()));
+            }
+            Symbol[] symbols = program.getSymbolTable().getSymbols(startAddr);
+            if (symbols.length > 0) {
+                result.append(String.format("Label: %s\n", symbols[0].getName()));
+            }
+            result.append("\n");
+
+            // Hex dump with 16 bytes per line
+            int bytesPerLine = 16;
+            for (int i = 0; i < bytesRead; i += bytesPerLine) {
+                Address lineAddr = startAddr.add(i);
+                
+                // Address column
+                result.append(String.format("%s:  ", lineAddr));
+
+                // Hex bytes
+                StringBuilder hexPart = new StringBuilder();
+                StringBuilder asciiPart = new StringBuilder();
+                
+                for (int j = 0; j < bytesPerLine; j++) {
+                    if (i + j < bytesRead) {
+                        byte b = bytes[i + j];
+                        hexPart.append(String.format("%02X ", b & 0xFF));
+                        
+                        // ASCII representation (printable chars only)
+                        if (b >= 32 && b < 127) {
+                            asciiPart.append((char) b);
+                        } else {
+                            asciiPart.append('.');
+                        }
+                    } else {
+                        hexPart.append("   ");
+                        asciiPart.append(' ');
+                    }
+                    
+                    // Add extra space in middle for readability
+                    if (j == 7) {
+                        hexPart.append(" ");
+                    }
+                }
+
+                result.append(hexPart);
+                result.append(" |");
+                result.append(asciiPart);
+                result.append("|\n");
+            }
+
+            // Add interpretation hints
+            result.append("\n--- Interpretation ---\n");
+            
+            // Show as potential addresses (little-endian)
+            int pointerSize = program.getDefaultPointerSize();
+            if (bytesRead >= pointerSize) {
+                result.append("As pointers (LE):\n");
+                for (int i = 0; i <= bytesRead - pointerSize; i += pointerSize) {
+                    long value = 0;
+                    for (int j = 0; j < pointerSize; j++) {
+                        value |= ((long)(bytes[i + j] & 0xFF)) << (j * 8);
+                    }
+                    Address ptrAddr = startAddr.add(i);
+                    String ptrStr = String.format(pointerSize == 4 ? "%08X" : "%016X", value);
+                    
+                    // Check if this points to a known function
+                    Address targetAddr = program.getAddressFactory().getAddress(ptrStr);
+                    String targetInfo = "";
+                    if (targetAddr != null) {
+                        Function targetFunc = program.getFunctionManager().getFunctionAt(targetAddr);
+                        if (targetFunc != null) {
+                            targetInfo = " -> " + targetFunc.getName();
+                        } else {
+                            Symbol[] targetSyms = program.getSymbolTable().getSymbols(targetAddr);
+                            if (targetSyms.length > 0) {
+                                targetInfo = " -> " + targetSyms[0].getName();
+                            }
+                        }
+                    }
+                    result.append(String.format("  %s: 0x%s%s\n", ptrAddr, ptrStr, targetInfo));
+                }
+            }
+
+            return result.toString();
+
+        } catch (Exception e) {
+            return "Error reading memory: " + e.getMessage();
+        }
+    }
 
     // ----------------------------------------------------------------------------------
     // Logic for rename, decompile, etc.
