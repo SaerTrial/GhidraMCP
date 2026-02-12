@@ -196,6 +196,28 @@ def read_memory(address: str, length: int = 16) -> list:
 
 
 @mcp.tool()
+def create_struct(name: str, fields: str) -> str:
+    """
+    Create a new structure data type in the program's data type manager.
+
+    Args:
+        name: Structure name (e.g., "notify_msg_envelope_t")
+        fields: Comma-separated field descriptors in "name:type:size" format.
+                Types: uint8_t, uint16_t, uint32_t, pointer, byte[0x4008], etc.
+                Size: decimal or 0x hex.
+
+    Example:
+        create_struct(
+            name="notify_msg_envelope_t",
+            fields="message_type:uint32_t:4,conn_ctx:pointer:4,payload:byte[0x4008]:0x4008,data_length:uint16_t:2,_pad:uint16_t:2,client_ip:uint32_t:4"
+        )
+    """
+    return safe_post("createStruct", {
+        "name": name,
+        "fields": fields
+    })
+
+@mcp.tool()
 def rename_variable(function_name: str, old_name: str, new_name: str) -> str:
     """
     Rename a local variable within a function.

@@ -36,10 +36,7 @@ import ghidra.util.task.ConsoleTaskMonitor;
 import ghidra.util.task.TaskMonitor;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
-import ghidra.program.model.data.DataType;
-import ghidra.program.model.data.DataTypeManager;
-import ghidra.program.model.data.PointerDataType;
-import ghidra.program.model.data.Undefined1DataType;
+import ghidra.program.model.data.*;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
@@ -218,6 +215,14 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, readMemoryRange(address, length));
         });
 
+        server.createContext("/createStruct", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String fieldsJson = params.get("fields");
+            sendResponse(exchange, createStruct(name, fieldsJson));
+        });
+
+
         // New API endpoints based on requirements
         
         server.createContext("/get_function_by_address", exchange -> {
@@ -237,7 +242,7 @@ public class GhidraMCPPlugin extends Plugin {
         server.createContext("/list_functions", exchange -> {
             sendResponse(exchange, listFunctions());
         });
-
+        
         server.createContext("/decompile_function", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
@@ -2085,6 +2090,158 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return params;
+    }
+
+    /**
+     * Create a new structure data type in the program's data type manager.
+     *
+     * Example request:
+     *   GET /createStruct?name=notify_msg_envelope_t&fields=message_type:uint32_t:4,conn_ctx:pointer:4,payload:byte[0x4008]:16392,data_length:uint16_t:2,_pad:uint16_t:2,client_ip:uint32_t:4
+     *
+     * Fields format: comma-separated "name:type:size" triples.
+     *   - name: field name
+     *   - type: Ghidra data type string (e.g. "uint32_t", "byte[0x4008]", "pointer")
+     *   - size: field size in bytes (decimal or 0x hex)
+     *
+     * @param name       Structure name
+     * @param fieldsJson Comma-separated field descriptors
+     * @return Summary of the created structure
+     */
+    private String createStruct(String name, String fieldsJson) {
+        Program program = getCurrentProgram();
+        DataTypeManager dtm = program.getDataTypeManager();
+
+        // Check if struct already exists
+        DataType existing = dtm.getDataType("/" + name);
+        if (existing != null) {
+            return "Error: struct '" + name + "' already exists at " + existing.getCategoryPath();
+        }
+
+        StructureDataType struct = new StructureDataType(name, 0);
+
+        String[] fieldDefs = fieldsJson.split(",");
+        StringBuilder sb = new StringBuilder();
+        sb.append("Created struct '").append(name).append("':\n");
+
+        int offset = 0;
+        for (String fieldDef : fieldDefs) {
+            String[] parts = fieldDef.trim().split(":");
+            if (parts.length < 3) {
+                return "Error: invalid field spec '" + fieldDef + "', expected name:type:size";
+            }
+
+            String fieldName = parts[0].trim();
+            String typeName = parts[1].trim();
+            int fieldSize = parseSize(parts[2].trim());
+
+            DataType fieldType = resolveDataType(dtm, typeName, fieldSize);
+            struct.add(fieldType, fieldSize, fieldName, null);
+
+            sb.append(String.format("  +0x%04X  %-24s  %s (%d bytes)\n",
+                    offset, fieldName, fieldType.getDisplayName(), fieldSize));
+            offset += fieldSize;
+        }
+
+        sb.append(String.format("  Total size: 0x%X (%d bytes)\n", offset, offset));
+
+        // Commit to the program's data type manager
+        int txId = program.startTransaction("Create struct " + name);
+        try {
+            dtm.addDataType(struct, DataTypeConflictHandler.REPLACE_HANDLER);
+        } finally {
+            program.endTransaction(txId, true);
+        }
+
+        sb.append("Struct added to data type manager.");
+        return sb.toString();
+    }
+
+    /**
+     * Parse a size value that may be decimal or hex (0x prefix).
+     */
+    private int parseSize(String s) {
+        if (s.startsWith("0x") || s.startsWith("0X")) {
+            return Integer.parseInt(s.substring(2), 16);
+        }
+        return Integer.parseInt(s);
+    }
+    
+    /**
+     * Resolve a type name string into a Ghidra DataType.
+     * Handles primitives, pointers, and array notation like "byte[0x4008]".
+     */
+    private DataType resolveDataType(DataTypeManager dtm, String typeName, int fieldSize) {
+        // Try array syntax: type[count]
+        if (typeName.contains("[")) {
+            int bracketOpen = typeName.indexOf('[');
+            int bracketClose = typeName.indexOf(']');
+            String baseTypeName = typeName.substring(0, bracketOpen).trim();
+            String countStr = typeName.substring(bracketOpen + 1, bracketClose).trim();
+            int count = parseSize(countStr);
+
+            DataType baseType = resolvePrimitive(dtm, baseTypeName);
+            return new ArrayDataType(baseType, count, baseType.getLength());
+        }
+
+        // Pointer type
+        if (typeName.equals("pointer") || typeName.equals("void*") || typeName.equals("ptr")) {
+            return PointerDataType.dataType;
+        }
+
+        return resolvePrimitive(dtm, typeName);
+    }
+
+    private DataType resolvePrimitive(DataTypeManager dtm, String typeName) {
+        // Try the program's DTM first (catches typedefs, user-defined types)
+        DataType dt = dtm.getDataType("/" + typeName);
+        if (dt != null) return dt;
+
+        // Built-in primitives
+        switch (typeName.toLowerCase()) {
+            case "byte":
+            case "uint8_t":
+            case "uchar":
+                return ByteDataType.dataType;
+            case "char":
+            case "int8_t":
+                return CharDataType.dataType;
+            case "short":
+            case "int16_t":
+                return ShortDataType.dataType;
+            case "ushort":
+            case "uint16_t":
+            case "word":
+                return UnsignedShortDataType.dataType;
+            case "int":
+            case "int32_t":
+                return IntegerDataType.dataType;
+            case "uint":
+            case "uint32_t":
+            case "dword":
+                return UnsignedIntegerDataType.dataType;
+            case "long":
+            case "int64_t":
+                return LongDataType.dataType;
+            case "ulong":
+            case "uint64_t":
+            case "qword":
+                return UnsignedLongDataType.dataType;
+            case "float":
+                return FloatDataType.dataType;
+            case "double":
+                return DoubleDataType.dataType;
+            case "bool":
+            case "boolean":
+                return BooleanDataType.dataType;
+            case "void":
+                return VoidDataType.dataType;
+            default:
+                // Try built-in DTM as last resort
+                DataType builtIn = BuiltInDataTypeManager.getDataTypeManager()
+                        .getDataType("/" + typeName);
+                if (builtIn != null) return builtIn;
+                return Undefined.getUndefinedDataType(1);
+        }
     }
 
     /**
