@@ -59,6 +59,13 @@ import ghidra.program.model.mem.Memory;
 import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.BuiltInDataTypeManager;
 
+import ghidra.program.model.block.IsolatedEntrySubModel;
+import ghidra.program.model.block.CodeBlock;
+import ghidra.program.model.block.CodeBlockIterator;
+import ghidra.program.model.address.AddressSet;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+
+
 @PluginInfo(
     status = PluginStatus.RELEASED,
     packageName = ghidra.app.DeveloperPluginPackage.NAME,
@@ -222,6 +229,13 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, createStruct(name, fieldsJson));
         });
 
+        server.createContext("/functionsByRefCount", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int limit = parseIntOrDefault(qparams.get("limit"), 10);
+            String order = qparams.get("order"); // "asc" or "desc" (default)
+            sendResponse(exchange, listFunctionsByRefCount(limit, order));
+        });
+
 
         // New API endpoints based on requirements
         
@@ -339,6 +353,27 @@ public class GhidraMCPPlugin extends Plugin {
             }
         });
 
+        server.createContext("/undefinedEntries", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, findUndefinedEntries(offset, limit));
+        });
+
+        server.createContext("/createFunction", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String name = params.get("name"); // optional function name
+            sendResponse(exchange, createFunctionAtAddress(address, name));
+        });
+
+        server.createContext("/analyzeUndefinedEntry", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            int instrCount = parseIntOrDefault(qparams.get("instructions"), 15);
+            sendResponse(exchange, analyzeUndefinedEntry(address, instrCount));
+        });
+
         server.createContext("/set_local_variable_type", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             String functionAddress = params.get("function_address");
@@ -409,7 +444,12 @@ public class GhidraMCPPlugin extends Plugin {
             int offset = parseIntOrDefault(qparams.get("offset"), 0);
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
-            sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+            int minLength = parseIntOrDefault(qparams.get("minLength"), 4);
+            int maxLength = parseIntOrDefault(qparams.get("maxLength"), 0); // 0 = no max
+            String segment = qparams.get("segment"); // filter by memory segment
+            boolean summary = "true".equalsIgnoreCase(qparams.get("summary")); // just return stats
+            
+            sendResponse(exchange, listDefinedStrings(offset, limit, filter, minLength, maxLength, segment, summary));
         });
 
         server.setExecutor(null);
@@ -810,9 +850,10 @@ public class GhidraMCPPlugin extends Plugin {
         return sb.toString();
     }
 
-   /**
+    /**
      * Read a range of memory bytes from a specified address.
      * Returns hex dump with ASCII representation.
+     * Respects the program's endianness when interpreting pointer values.
      * 
      * @param addressStr Starting address (hex with optional 0x prefix)
      * @param length Number of bytes to read (default 16, max 4096)
@@ -841,6 +882,10 @@ public class GhidraMCPPlugin extends Plugin {
                 return "Address " + addressStr + " is not in valid memory";
             }
 
+            // Get the program's endianness
+            boolean isBigEndian = program.getLanguage().isBigEndian();
+            String endianStr = isBigEndian ? "BE" : "LE";
+
             // Read the bytes
             byte[] bytes = new byte[length];
             int bytesRead = memory.getBytes(startAddr, bytes, 0, length);
@@ -851,7 +896,8 @@ public class GhidraMCPPlugin extends Plugin {
 
             // Format as hex dump
             StringBuilder result = new StringBuilder();
-            result.append(String.format("Memory dump from %s (%d bytes):\n\n", startAddr, bytesRead));
+            result.append(String.format("Memory dump from %s (%d bytes, %s):\n\n", 
+                startAddr, bytesRead, endianStr));
 
             // Add context info
             Function func = program.getFunctionManager().getFunctionContaining(startAddr);
@@ -907,19 +953,29 @@ public class GhidraMCPPlugin extends Plugin {
             // Add interpretation hints
             result.append("\n--- Interpretation ---\n");
             
-            // Show as potential addresses (little-endian)
+            // Show as potential addresses (respecting program endianness)
             int pointerSize = program.getDefaultPointerSize();
             if (bytesRead >= pointerSize) {
-                result.append("As pointers (LE):\n");
+                result.append(String.format("As pointers (%s):\n", endianStr));
                 for (int i = 0; i <= bytesRead - pointerSize; i += pointerSize) {
                     long value = 0;
-                    for (int j = 0; j < pointerSize; j++) {
-                        value |= ((long)(bytes[i + j] & 0xFF)) << (j * 8);
+                    
+                    if (isBigEndian) {
+                        // Big-endian: MSB first
+                        for (int j = 0; j < pointerSize; j++) {
+                            value = (value << 8) | (bytes[i + j] & 0xFF);
+                        }
+                    } else {
+                        // Little-endian: LSB first
+                        for (int j = 0; j < pointerSize; j++) {
+                            value |= ((long)(bytes[i + j] & 0xFF)) << (j * 8);
+                        }
                     }
+                    
                     Address ptrAddr = startAddr.add(i);
                     String ptrStr = String.format(pointerSize == 4 ? "%08X" : "%016X", value);
                     
-                    // Check if this points to a known function
+                    // Check if this points to a known function or symbol
                     Address targetAddr = program.getAddressFactory().getAddress(ptrStr);
                     String targetInfo = "";
                     if (targetAddr != null) {
@@ -943,6 +999,7 @@ public class GhidraMCPPlugin extends Plugin {
             return "Error reading memory: " + e.getMessage();
         }
     }
+
 
     // ----------------------------------------------------------------------------------
     // Logic for rename, decompile, etc.
@@ -1641,6 +1698,61 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
+     * List functions sorted by their incoming reference count.
+     * 
+     * @param limit Maximum number of functions to return (default: 10)
+     * @param order Sort order: "asc" for ascending, "desc" for descending (default)
+     * @return Formatted string of functions with their reference counts
+     */
+    private String listFunctionsByRefCount(int limit, String order) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        FunctionManager funcManager = program.getFunctionManager();
+        ReferenceManager refManager = program.getReferenceManager();
+
+        // Build a list of (function, refCount) pairs
+        List<Map.Entry<Function, Integer>> functionRefCounts = new ArrayList<>();
+
+        for (Function func : funcManager.getFunctions(true)) {
+            Address entryPoint = func.getEntryPoint();
+            int refCount = refManager.getReferenceCountTo(entryPoint);
+            functionRefCounts.add(new AbstractMap.SimpleEntry<>(func, refCount));
+        }
+
+        // Sort by reference count
+        boolean ascending = "asc".equalsIgnoreCase(order);
+        functionRefCounts.sort((a, b) -> {
+            int cmp = Integer.compare(a.getValue(), b.getValue());
+            return ascending ? cmp : -cmp;
+        });
+
+        // Build output
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (Map.Entry<Function, Integer> entry : functionRefCounts) {
+            if (count >= limit) break;
+            
+            Function func = entry.getKey();
+            int refCount = entry.getValue();
+            
+            sb.append(String.format("%d refs: %s @ %s\n", 
+                refCount, 
+                func.getName(), 
+                func.getEntryPoint()));
+            count++;
+        }
+
+        if (sb.length() == 0) {
+            return "No functions found";
+        }
+
+        return sb.toString().trim();
+    }
+
+
+
+    /**
      * Helper method that performs the actual variable type change
      */
     private void applyVariableType(Program program, String functionAddrStr, 
@@ -1715,6 +1827,279 @@ public class GhidraMCPPlugin extends Plugin {
         }
         return null;
     }
+
+    /**
+     * Find undefined entries - code that exists but is not part of any defined function.
+     * This is common in firmware where data and code are mixed.
+     */
+    private String findUndefinedEntries(int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        try {
+            Listing listing = program.getListing();
+            Memory memory = program.getMemory();
+            ReferenceManager refManager = program.getReferenceManager();
+            
+            // Build address set of all instructions
+            AddressSet instructionSet = new AddressSet();
+            InstructionIterator instrIter = listing.getInstructions(memory, true);
+            while (instrIter.hasNext()) {
+                Instruction instr = instrIter.next();
+                instructionSet.addRange(instr.getMinAddress(), instr.getMaxAddress());
+            }
+            
+            // Remove addresses that are inside defined functions
+            FunctionIterator funcIter = listing.getFunctions(true);
+            while (funcIter.hasNext()) {
+                Function func = funcIter.next();
+                instructionSet.delete(func.getBody());
+            }
+            
+            if (instructionSet.getNumAddressRanges() == 0) {
+                return "No undefined entries found - all instructions are contained inside functions";
+            }
+            
+            // Find entry points of isolated code blocks
+            ghidra.program.model.block.IsolatedEntrySubModel submodel = 
+                new ghidra.program.model.block.IsolatedEntrySubModel(program);
+            ghidra.program.model.block.CodeBlockIterator blockIter = 
+                submodel.getCodeBlocksContaining(instructionSet, new ConsoleTaskMonitor());
+            
+            // Collect unique start addresses
+            Set<Address> codeStarts = new LinkedHashSet<>();
+            while (blockIter.hasNext()) {
+                ghidra.program.model.block.CodeBlock block = blockIter.next();
+                Address start = block.getFirstStartAddress();
+                codeStarts.add(start);
+            }
+            
+            List<String> results = new ArrayList<>();
+            int totalEntries = codeStarts.size();
+            
+            // Add summary header
+            results.add(String.format("Found %d undefined entries\n", totalEntries));
+            
+            int index = 0;
+            for (Address addr : codeStarts) {
+                if (index < offset) {
+                    index++;
+                    continue;
+                }
+                if (index >= offset + limit) {
+                    break;
+                }
+                
+                // Get first instruction
+                Instruction instr = listing.getInstructionAt(addr);
+                String instrStr = instr != null ? instr.toString() : "??";
+                
+                // Count references
+                int refCount = refManager.getReferenceCountTo(addr);
+                
+                // Check for CALL references
+                boolean hasCallRef = false;
+                ReferenceIterator refIter = refManager.getReferencesTo(addr);
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    if (ref.getReferenceType().isCall()) {
+                        hasCallRef = true;
+                        break;
+                    }
+                }
+                
+                // Format: address | instruction | refs | call indicator
+                String callIndicator = hasCallRef ? " [CALL]" : "";
+                results.add(String.format("%s | %-30s | refs:%d%s", 
+                    addr, instrStr, refCount, callIndicator));
+                
+                index++;
+            }
+            
+            // Add pagination info
+            results.add(String.format("\nShowing %d-%d of %d", 
+                Math.min(offset + 1, totalEntries),
+                Math.min(offset + limit, totalEntries),
+                totalEntries));
+            
+            return String.join("\n", results);
+            
+        } catch (Exception e) {
+            return "Error finding undefined entries: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Analyze a single undefined entry by showing its assembly and references.
+     * Let the LLM determine if it's a valid function based on the instructions.
+     */
+    private String analyzeUndefinedEntry(String addressStr, int instrCount) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            if (addr == null) return "Invalid address: " + addressStr;
+            
+            Listing listing = program.getListing();
+            ReferenceManager refManager = program.getReferenceManager();
+            
+            StringBuilder result = new StringBuilder();
+            result.append(String.format("=== Undefined entry at %s ===\n\n", addr));
+            
+            // Check if already a function
+            Function existingFunc = program.getFunctionManager().getFunctionAt(addr);
+            if (existingFunc != null) {
+                result.append(String.format("Already defined as function: %s\n", existingFunc.getName()));
+                return result.toString();
+            }
+            
+            // Check if there's an instruction
+            Instruction firstInstr = listing.getInstructionAt(addr);
+            if (firstInstr == null) {
+                result.append("No instruction at this address - this is data, not code.\n");
+                return result.toString();
+            }
+            
+            // Show assembly instructions
+            result.append(String.format("Assembly (%d instructions):\n", instrCount));
+            Address currentAddr = addr;
+            Set<Address> visited = new HashSet<>();
+            int count = 0;
+            
+            while (count < instrCount && currentAddr != null && !visited.contains(currentAddr)) {
+                visited.add(currentAddr);
+                Instruction instr = listing.getInstructionAt(currentAddr);
+                if (instr == null) break;
+                
+                result.append(String.format("  %s: %s\n", currentAddr, instr.toString()));
+                count++;
+                
+                // Follow flow
+                currentAddr = instr.getFallThrough();
+                if (currentAddr == null) {
+                    // Check for unconditional jump
+                    FlowType flowType = instr.getFlowType();
+                    if (flowType.isJump() && !flowType.isConditional()) {
+                        Address[] flows = instr.getFlows();
+                        if (flows.length > 0) {
+                            currentAddr = flows[0];
+                        }
+                    }
+                }
+            }
+            
+            // Show references TO this address
+            result.append("\nReferences to this address:\n");
+            ReferenceIterator refsToIter = refManager.getReferencesTo(addr);
+            List<Reference> refsTo = new ArrayList<>();
+            while (refsToIter.hasNext()) {
+                refsTo.add(refsToIter.next());
+            }
+            if (refsTo.isEmpty()) {
+                result.append("  (none)\n");
+            } else {
+                int refCount = 0;
+                for (Reference ref : refsTo) {
+                    if (refCount >= 10) {
+                        result.append(String.format("  ... and %d more\n", refsTo.size() - 10));
+                        break;
+                    }
+                    Address fromAddr = ref.getFromAddress();
+                    Function fromFunc = program.getFunctionManager().getFunctionContaining(fromAddr);
+                    String funcName = fromFunc != null ? fromFunc.getName() : "<undefined>";
+                    result.append(String.format("  %s from %s [%s]\n", 
+                        ref.getReferenceType(), fromAddr, funcName));
+                    refCount++;
+                }
+            }
+            
+            return result.toString();
+            
+        } catch (Exception e) {
+            return "Error analyzing entry: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Create a function at the specified address.
+     */
+    private String createFunctionAtAddress(String addressStr, String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        
+        final StringBuilder result = new StringBuilder();
+        final Address addr;
+        
+        try {
+            addr = program.getAddressFactory().getAddress(addressStr);
+            if (addr == null) return "Invalid address: " + addressStr;
+        } catch (Exception e) {
+            return "Invalid address format: " + addressStr;
+        }
+        
+        // Check if function already exists
+        Function existingFunc = program.getFunctionManager().getFunctionAt(addr);
+        if (existingFunc != null) {
+            return String.format("Function already exists at %s: %s", addr, existingFunc.getName());
+        }
+        
+        // Check if there's an instruction at the address
+        Instruction instr = program.getListing().getInstructionAt(addr);
+        if (instr == null) {
+            return String.format("No instruction at %s - cannot create function (this is data)", addr);
+        }
+        
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int txId = program.startTransaction("Create function at " + addr);
+                try {
+                    ghidra.app.cmd.function.CreateFunctionCmd cmd = 
+                        new ghidra.app.cmd.function.CreateFunctionCmd(addr);
+                    
+                    boolean success = cmd.applyTo(program, new ConsoleTaskMonitor());
+                    
+                    if (success) {
+                        Function newFunc = program.getFunctionManager().getFunctionAt(addr);
+                        if (newFunc != null) {
+                            // Set custom name if provided
+                            if (name != null && !name.isEmpty()) {
+                                try {
+                                    newFunc.setName(name, SourceType.USER_DEFINED);
+                                    result.append(String.format("Created function '%s' at %s", name, addr));
+                                } catch (Exception e) {
+                                    result.append(String.format("Created function at %s (naming failed: %s)", 
+                                        addr, e.getMessage()));
+                                }
+                            } else {
+                                result.append(String.format("Created function '%s' at %s", 
+                                    newFunc.getName(), addr));
+                            }
+                            
+                            // Add function size info
+                            result.append(String.format(" [%d bytes]", 
+                                newFunc.getBody().getNumAddresses()));
+                        } else {
+                            result.append("Function created but could not retrieve it");
+                        }
+                    } else {
+                        result.append("Failed to create function: " + cmd.getStatusMsg());
+                    }
+                } catch (Exception e) {
+                    result.append("Error creating function: " + e.getMessage());
+                } finally {
+                    program.endTransaction(txId, true);
+                }
+            });
+        } catch (Exception e) {
+            return "Error executing on Swing thread: " + e.getMessage();
+        }
+        
+        return result.toString();
+    }
+
 
     /**
      * Decompile a function and return the results
@@ -1869,30 +2254,108 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
-/**
- * List all defined strings in the program with their addresses
- */
-    private String listDefinedStrings(int offset, int limit, String filter) {
+    /**
+     * List defined strings in the program with filtering options.
+     * 
+     * @param offset Pagination offset
+     * @param limit Maximum number of strings to return
+     * @param filter Substring filter (case-insensitive)
+     * @param minLength Minimum string length (default: 4)
+     * @param maxLength Maximum string length (0 = no limit)
+     * @param segment Filter by memory segment name (e.g., ".rodata", ".data")
+     * @param summary If true, return only statistics without listing strings
+     * @return Formatted string list or summary statistics
+     */
+    private String listDefinedStrings(int offset, int limit, String filter, 
+                                    int minLength, int maxLength, 
+                                    String segment, boolean summary) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
 
         List<String> lines = new ArrayList<>();
         DataIterator dataIt = program.getListing().getDefinedData(true);
         
+        // Statistics counters
+        int totalStrings = 0;
+        int matchedStrings = 0;
+        int shortestLength = Integer.MAX_VALUE;
+        int longestLength = 0;
+        Map<String, Integer> segmentCounts = new HashMap<>();
+        
         while (dataIt.hasNext()) {
             Data data = dataIt.next();
             
             if (data != null && isStringData(data)) {
                 String value = data.getValue() != null ? data.getValue().toString() : "";
+                int strLength = value.length();
+                totalStrings++;
                 
-                if (filter == null || value.toLowerCase().contains(filter.toLowerCase())) {
+                // Track statistics
+                if (strLength < shortestLength && strLength > 0) shortestLength = strLength;
+                if (strLength > longestLength) longestLength = strLength;
+                
+                // Track segment counts
+                MemoryBlock block = program.getMemory().getBlock(data.getAddress());
+                String blockName = (block != null) ? block.getName() : "unknown";
+                segmentCounts.merge(blockName, 1, Integer::sum);
+                
+                // Apply filters
+                if (strLength < minLength) continue;
+                if (maxLength > 0 && strLength > maxLength) continue;
+                if (filter != null && !value.toLowerCase().contains(filter.toLowerCase())) continue;
+                if (segment != null && !blockName.equalsIgnoreCase(segment)) continue;
+                
+                matchedStrings++;
+                
+                if (!summary) {
                     String escapedValue = escapeString(value);
-                    lines.add(String.format("%s: \"%s\"", data.getAddress(), escapedValue));
+                    // Truncate very long strings for display
+                    if (escapedValue.length() > 100) {
+                        escapedValue = escapedValue.substring(0, 97) + "...";
+                    }
+                    lines.add(String.format("%s [%s] (%d): \"%s\"", 
+                        data.getAddress(), blockName, strLength, escapedValue));
                 }
             }
         }
         
-        return paginateList(lines, offset, limit);
+        // Return summary if requested
+        if (summary) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== String Statistics ===\n\n");
+            sb.append(String.format("Total defined strings: %d\n", totalStrings));
+            sb.append(String.format("Matched strings (with current filters): %d\n", matchedStrings));
+            sb.append(String.format("Shortest string: %d chars\n", shortestLength == Integer.MAX_VALUE ? 0 : shortestLength));
+            sb.append(String.format("Longest string: %d chars\n", longestLength));
+            sb.append("\nStrings by segment:\n");
+            
+            // Sort segments by count descending
+            segmentCounts.entrySet().stream()
+                .sorted((a, b) -> b.getValue().compareTo(a.getValue()))
+                .forEach(e -> sb.append(String.format("  %s: %d strings\n", e.getKey(), e.getValue())));
+            
+            sb.append("\nCurrent filters:\n");
+            sb.append(String.format("  Min length: %d\n", minLength));
+            sb.append(String.format("  Max length: %s\n", maxLength > 0 ? maxLength : "unlimited"));
+            if (filter != null) sb.append(String.format("  Contains: \"%s\"\n", filter));
+            if (segment != null) sb.append(String.format("  Segment: %s\n", segment));
+            
+            return sb.toString();
+        }
+        
+        if (lines.isEmpty()) {
+            return "No strings found matching the criteria";
+        }
+        
+        // Add header with match info
+        StringBuilder result = new StringBuilder();
+        result.append(String.format("Found %d strings (showing %d-%d):\n\n", 
+            matchedStrings, 
+            Math.min(offset + 1, matchedStrings),
+            Math.min(offset + limit, matchedStrings)));
+        result.append(paginateList(lines, offset, limit));
+        
+        return result.toString();
     }
 
     /**

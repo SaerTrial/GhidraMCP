@@ -228,6 +228,33 @@ def rename_variable(function_name: str, old_name: str, new_name: str) -> str:
         "newName": new_name
     })
 
+
+@mcp.tool()
+def list_functions_by_refcount(limit: int = 10, order: str = "desc") -> list:
+    """
+    List functions sorted by their incoming reference count.
+    
+    This is useful for identifying:
+    - Most called functions (order="desc") - often utility functions, core logic
+    - Least called functions (order="asc") - potentially dead code, entry points
+    
+    Args:
+        limit: Maximum number of functions to return (default: 10)
+        order: Sort order - "desc" for most referenced first (default), 
+               "asc" for least referenced first
+    
+    Returns:
+        List of functions with their reference counts, sorted accordingly
+    
+    Example output:
+        156 refs: memcpy @ 0x00012340
+        142 refs: strlen @ 0x00012450
+        98 refs: FUN_00019d62 @ 0x00019d62
+        ...
+    """
+    return safe_get("functionsByRefCount", {"limit": str(limit), "order": order})
+
+
 @mcp.tool()
 def get_function_by_address(address: str) -> str:
     """
@@ -364,23 +391,177 @@ def get_function_xrefs(name: str, offset: int = 0, limit: int = 100) -> list:
     """
     return safe_get("function_xrefs", {"name": name, "offset": offset, "limit": limit})
 
+
 @mcp.tool()
-def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list:
+def list_strings(
+    offset: int = 0, 
+    limit: int = 100, 
+    filter: str = None,
+    min_length: int = 4,
+    max_length: int = 0,
+    segment: str = None,
+    summary: bool = False
+) -> list:
     """
-    List all defined strings in the program with their addresses.
+    List defined strings in the program with filtering options.
+    
+    Designed to handle binaries with many strings efficiently by providing:
+    - Pagination (offset/limit)
+    - Content filtering
+    - Length filtering  
+    - Segment filtering
+    - Summary statistics mode
     
     Args:
         offset: Pagination offset (default: 0)
-        limit: Maximum number of strings to return (default: 2000)
-        filter: Optional filter to match within string content
+        limit: Maximum number of strings to return (default: 100)
+        filter: Optional substring filter (case-insensitive)
+        min_length: Minimum string length to include (default: 4)
+        max_length: Maximum string length (0 = no limit)
+        segment: Filter by memory segment name (e.g., ".rodata", ".text")
+        summary: If True, return only statistics without string list
         
     Returns:
-        List of strings with their addresses
+        List of strings with addresses, or summary statistics
+        
+    Examples:
+        # Get first 50 strings
+        list_strings(limit=50)
+        
+        # Search for error messages
+        list_strings(filter="error", limit=100)
+        
+        # Find long strings (potential paths, URLs)
+        list_strings(min_length=50, limit=50)
+        
+        # Get strings from .rodata section only
+        list_strings(segment=".rodata", limit=100)
+        
+        # Get summary statistics first
+        list_strings(summary=True)
     """
-    params = {"offset": offset, "limit": limit}
+    params = {
+        "offset": str(offset), 
+        "limit": str(limit),
+        "minLength": str(min_length),
+        "maxLength": str(max_length),
+        "summary": "true" if summary else "false"
+    }
     if filter:
         params["filter"] = filter
+    if segment:
+        params["segment"] = segment
+        
     return safe_get("strings", params)
+
+
+@mcp.tool()
+def list_undefined_entries(offset: int = 0, limit: int = 100) -> list:
+    """
+    Find undefined entries - code that exists but is not part of any defined function.
+    
+    This is common in firmware where data and code are mixed together. These are
+    potential functions that Ghidra's auto-analysis missed.
+    
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of entries to return (default: 100)
+        
+    Returns:
+        List of undefined entry addresses with:
+        - First instruction at the entry
+        - Reference count
+        - [CALL] indicator if any reference is a CALL type
+        
+    Example output:
+        a0055700 | prepare 0x1c,0x1e                 | refs:3 [CALL]
+        a0055710 | mov r1, r5                        | refs:0
+        a0055718 | jr [r4]                           | refs:1
+    """
+    return safe_get("undefinedEntries", {"offset": str(offset), "limit": str(limit)})
+
+
+@mcp.tool()
+def analyze_undefined_entry(address: str, instructions: int = 15) -> str:
+    """
+    Analyze a single undefined entry by showing its assembly and references.
+    
+    Use this to inspect an entry before deciding whether to create a function.
+    The assembly output lets you determine if it's valid code or data.
+    
+    Args:
+        address: Address of the undefined entry (hex format)
+        instructions: Number of instructions to disassemble (default: 15)
+        
+    Returns:
+        - Assembly listing of the first N instructions
+        - References to this address (who calls/jumps here)
+        
+    Example:
+        analyze_undefined_entry("a0055700")
+        analyze_undefined_entry("a0055700", instructions=30)
+    """
+    return "\n".join(safe_get("analyzeUndefinedEntry", {
+        "address": address, 
+        "instructions": str(instructions)
+    }))
+
+
+@mcp.tool()
+def create_function(address: str, name: str = None) -> str:
+    """
+    Create a function at the specified address.
+    
+    Use this after analyzing an undefined entry that looks like valid function code.
+    Ghidra will automatically determine the function boundaries.
+    
+    Args:
+        address: Address where to create the function (hex format)
+        name: Optional name for the function. If not provided, Ghidra
+              will auto-generate a name like FUN_xxxxxxxx
+              
+    Returns:
+        Success/failure message with function details
+        
+    Examples:
+        create_function("a0055700")
+        create_function("a0055700", "process_packet")
+    """
+    params = {"address": address}
+    if name:
+        params["name"] = name
+    return safe_post("createFunction", params)
+
+
+@mcp.tool()
+def search_strings(query: str, limit: int = 50) -> list:
+    """
+    Convenience function to search for strings containing a specific substring.
+    
+    This is a simpler wrapper around list_strings for quick searches.
+    
+    Args:
+        query: Substring to search for (case-insensitive)
+        limit: Maximum results to return (default: 50)
+        
+    Returns:
+        List of matching strings with their addresses
+        
+    Examples:
+        search_strings("password")
+        search_strings("http://")
+        search_strings("error")
+        search_strings(".dll")
+    """
+    return safe_get("strings", {
+        "offset": "0",
+        "limit": str(limit),
+        "filter": query,
+        "minLength": "1",
+        "maxLength": "0",
+        "summary": "false"
+    })
+
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
