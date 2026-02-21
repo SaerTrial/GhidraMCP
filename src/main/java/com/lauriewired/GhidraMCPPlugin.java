@@ -415,6 +415,21 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, responseMsg.toString());
         });
 
+
+        server.createContext("/createSegment", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String start = params.get("start");
+            String length = params.get("length");
+            String type = params.get("type"); // RAM, ROM, or other
+            boolean read = !"false".equalsIgnoreCase(params.get("read"));
+            boolean write = !"false".equalsIgnoreCase(params.get("write"));
+            boolean execute = !"false".equalsIgnoreCase(params.get("execute"));
+            boolean volatileMem = "true".equalsIgnoreCase(params.get("volatile"));
+            boolean overlay = "true".equalsIgnoreCase(params.get("overlay"));
+            sendResponse(exchange, createMemorySegment(name, start, length, type, read, write, execute, volatileMem, overlay));
+        });
+
         server.createContext("/xrefs_to", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
@@ -2021,6 +2036,178 @@ public class GhidraMCPPlugin extends Plugin {
             return "Error analyzing entry: " + e.getMessage();
         }
     }
+
+    /**
+     * Create a new memory segment/block in the program.
+     * 
+     * @param name      Name of the segment (e.g., "DIAG_RAM")
+     * @param startStr  Start address in hex (e.g., "0xFEBDE000")
+     * @param lengthStr Length in hex or decimal (e.g., "0x2000" or "8192")
+     * @param type      Memory type: "RAM", "ROM", "CODE", "DATA", etc.
+     * @param read      Read permission (default: true)
+     * @param write     Write permission (default: true)
+     * @param execute   Execute permission (default: true)
+     * @param volatileMem Whether memory is volatile (default: false)
+     * @param overlay   Create as overlay block (default: false)
+     * @return Result message
+     */
+    private String createMemorySegment(String name, String startStr, String lengthStr, 
+                                        String type, boolean read, boolean write, 
+                                        boolean execute, boolean volatileMem, boolean overlay) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        
+        if (name == null || name.isEmpty()) return "Segment name is required";
+        if (startStr == null || startStr.isEmpty()) return "Start address is required";
+        if (lengthStr == null || lengthStr.isEmpty()) return "Length is required";
+        
+        final StringBuilder result = new StringBuilder();
+        
+        try {
+            // Parse start address
+            Address startAddr = program.getAddressFactory().getAddress(startStr);
+            if (startAddr == null) {
+                // Try parsing as hex number and creating in default space
+                long startLong = parseHexOrDecimal(startStr);
+                startAddr = program.getAddressFactory().getDefaultAddressSpace().getAddress(startLong);
+            }
+            if (startAddr == null) {
+                return "Invalid start address: " + startStr;
+            }
+            
+            // Parse length
+            long length = parseHexOrDecimal(lengthStr);
+            if (length <= 0) {
+                return "Invalid length: " + lengthStr;
+            }
+            
+            final Address finalStartAddr = startAddr;
+            final long finalLength = length;
+            
+            // Determine memory type defaults
+            final boolean finalRead = read;
+            final boolean finalWrite;
+            final boolean finalExecute;
+            
+            if (type != null) {
+                String typeUpper = type.toUpperCase();
+                if (typeUpper.equals("RAM")) {
+                    finalWrite = write;
+                    finalExecute = execute;
+                } else if (typeUpper.equals("ROM") || typeUpper.equals("FLASH")) {
+                    finalWrite = false; // ROM is not writable by default
+                    finalExecute = execute;
+                } else if (typeUpper.equals("CODE")) {
+                    finalWrite = write;
+                    finalExecute = true;
+                } else if (typeUpper.equals("DATA")) {
+                    finalWrite = write;
+                    finalExecute = false;
+                } else {
+                    finalWrite = write;
+                    finalExecute = execute;
+                }
+            } else {
+                finalWrite = write;
+                finalExecute = execute;
+            }
+            
+            SwingUtilities.invokeAndWait(() -> {
+                int txId = program.startTransaction("Create memory segment: " + name);
+                boolean success = false;
+                try {
+                    Memory memory = program.getMemory();
+                    
+                    // Check for overlapping blocks
+                    MemoryBlock existingBlock = memory.getBlock(finalStartAddr);
+                    if (existingBlock != null && !overlay) {
+                        result.append(String.format("Error: Address %s is already in block '%s'\n", 
+                            finalStartAddr, existingBlock.getName()));
+                        result.append("Use overlay=true to create an overlay block");
+                        return;
+                    }
+                    
+                    // Use command to create initialized memory block (filled with zeros)
+                    ghidra.app.cmd.memory.AddInitializedMemoryBlockCmd cmd = 
+                        new ghidra.app.cmd.memory.AddInitializedMemoryBlockCmd(
+                            name,
+                            null, // comment
+                            type != null ? type.toUpperCase() : "RAM", // source
+                            finalStartAddr,
+                            finalLength,
+                            finalRead,
+                            finalWrite,
+                            finalExecute,
+                            volatileMem,
+                            (byte) 0x00,  // initial value - fill with zeros
+                            overlay
+                        );
+                    
+                    if (cmd.applyTo(program)) {
+                        MemoryBlock newBlock = memory.getBlock(finalStartAddr);
+                        if (newBlock != null) {
+                            Address endAddr = finalStartAddr.add(finalLength - 1);
+                            result.append(String.format("Created segment '%s'\n", name));
+                            result.append(String.format("  Range: %s - %s\n", finalStartAddr, endAddr));
+                            result.append(String.format("  Size: 0x%X (%d bytes)\n", finalLength, finalLength));
+                            result.append(String.format("  Type: %s\n", type != null ? type.toUpperCase() : "RAM"));
+                            result.append(String.format("  Permissions: %s%s%s\n", 
+                                finalRead ? "R" : "-",
+                                finalWrite ? "W" : "-",
+                                finalExecute ? "X" : "-"));
+                            result.append("  Initialized: YES (zero-filled)\n");
+                            if (volatileMem) {
+                                result.append("  Volatile: YES\n");
+                            }
+                            if (overlay) {
+                                result.append("  Overlay: YES\n");
+                            }
+                            success = true;
+                        } else {
+                            result.append("Block created but could not retrieve it");
+                        }
+                    } else {
+                        result.append("Failed to create segment: " + cmd.getStatusMsg());
+                    }
+                    
+                } catch (Throwable e) {
+                    result.append("Error creating segment: " + e.getClass().getSimpleName() + " - " + e.getMessage());
+                } finally {
+                    program.endTransaction(txId, success);
+                }
+            });
+            
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+        
+        return result.toString();
+    }
+
+    /**
+     * Parse a string as hex (0x prefix) or decimal number.
+     */
+    private long parseHexOrDecimal(String str) {
+        if (str == null || str.isEmpty()) return 0;
+        str = str.trim();
+        try {
+            if (str.startsWith("0x") || str.startsWith("0X")) {
+                return Long.parseLong(str.substring(2), 16);
+            } else if (str.startsWith("-0x") || str.startsWith("-0X")) {
+                return -Long.parseLong(str.substring(3), 16);
+            } else {
+                return Long.parseLong(str);
+            }
+        } catch (NumberFormatException e) {
+            // Try parsing as hex without prefix
+            try {
+                return Long.parseLong(str, 16);
+            } catch (NumberFormatException e2) {
+                return 0;
+            }
+        }
+    }
+
 
     /**
      * Create a function at the specified address.

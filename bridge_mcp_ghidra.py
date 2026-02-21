@@ -563,6 +563,68 @@ def search_strings(query: str, limit: int = 50) -> list:
     })
 
 
+@mcp.tool()
+def create_segment(
+    name: str,
+    start: str,
+    length: str,
+    type: str = "RAM",
+    read: bool = True,
+    write: bool = True,
+    execute: bool = True,
+    volatile: bool = False,
+    overlay: bool = False
+) -> str:
+    """
+    Create a new memory segment/block in the program.
+    
+    This is useful for defining memory-mapped regions like peripheral registers,
+    diagnostic RAM, or other memory areas not present in the original binary.
+    
+    Args:
+        name: Name of the segment (e.g., "DIAG_RAM", "PERIPHERAL_REGS")
+        start: Start address in hex (e.g., "0xFEBDE000")
+        length: Length in hex or decimal (e.g., "0x2000" or "8192")
+        type: Memory type - affects default permissions:
+              - "RAM": Read/Write/Execute (default)
+              - "ROM" or "FLASH": Read/Execute only
+              - "CODE": Read/Write/Execute
+              - "DATA": Read/Write only
+        read: Read permission (default: True)
+        write: Write permission (default: True, False for ROM)
+        execute: Execute permission (default: True, False for DATA)
+        volatile: Mark as volatile memory (default: False)
+        overlay: Create as overlay block if address conflicts (default: False)
+        
+    Returns:
+        Success message with segment details or error message
+        
+    Examples:
+        # Create a diagnostic RAM region
+        create_segment("DIAG_RAM", "0xFEBDE000", "0x2000", "RAM")
+        
+        # Create a peripheral register region (read/write, no execute)
+        create_segment("UART_REGS", "0xF0000000", "0x100", "DATA")
+        
+        # Create ROM region
+        create_segment("BOOTROM", "0x80000000", "0x10000", "ROM")
+        
+        # Create overlay if address already exists
+        create_segment("DEBUG_OVERLAY", "0x00100000", "0x1000", "RAM", overlay=True)
+    """
+    params = {
+        "name": name,
+        "start": start,
+        "length": length,
+        "type": type,
+        "read": "true" if read else "false",
+        "write": "true" if write else "false",
+        "execute": "true" if execute else "false",
+        "volatile": "true" if volatile else "false",
+        "overlay": "true" if overlay else "false"
+    }
+    return safe_post("createSegment", params)
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
