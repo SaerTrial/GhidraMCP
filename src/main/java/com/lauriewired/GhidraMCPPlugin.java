@@ -467,6 +467,10 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listDefinedStrings(offset, limit, filter, minLength, maxLength, segment, summary));
         });
 
+        server.createContext("/programInfo", exchange -> {
+            sendResponse(exchange, getProgramInfo());
+        });
+
         server.setExecutor(null);
         new Thread(() -> {
             try {
@@ -477,6 +481,23 @@ public class GhidraMCPPlugin extends Plugin {
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
+    }
+
+    private String getProgramInfo() {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        // getDomainFile().getName() reflects renames done in the Ghidra project window,
+        // whereas program.getName() may retain the original import name.
+        String programName;
+        String projectDir = "";
+        try {
+            programName = program.getDomainFile().getName();
+            projectDir = program.getDomainFile().getProjectLocator().getProjectDir().getAbsolutePath();
+        } catch (Exception e) {
+            programName = program.getName();
+        }
+        return programName + "\n" + projectDir;
     }
 
     // ----------------------------------------------------------------------------------

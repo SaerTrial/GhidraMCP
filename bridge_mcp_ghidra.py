@@ -7,9 +7,13 @@
 # ///
 
 import sys
+import json
+import os
 import requests
 import argparse
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urljoin
 
 from mcp.server.fastmcp import FastMCP
@@ -56,6 +60,80 @@ def safe_post(endpoint: str, data: dict | str) -> str:
             return f"Error {response.status_code}: {response.text.strip()}"
     except Exception as e:
         return f"Request failed: {str(e)}"
+
+###############################################################################
+# Persistent RE context helpers (local file I/O, no Ghidra endpoint needed)
+###############################################################################
+
+_EMPTY_CONTEXT = {
+    "meta": {"binary_name": "", "created": "", "last_updated": "", "sessions": 0},
+    "functions": {},
+    "structs": {},
+    "globals": {},
+    "hypotheses": [],
+    "next_targets": [],
+    "open_threads": [],
+    "dead_ends": [],
+    "session_log": [],
+}
+
+def _load_context_file() -> dict:
+    p = _resolve_context_path()
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    name, _ = _get_program_info()
+    ctx = json.loads(json.dumps(_EMPTY_CONTEXT))  # deep copy
+    ctx["meta"]["binary_name"] = name
+    now = datetime.now(timezone.utc).isoformat()
+    ctx["meta"]["created"] = now
+    ctx["meta"]["last_updated"] = now
+    return ctx
+
+def _save_context_file(data: dict) -> None:
+    data["meta"]["last_updated"] = datetime.now(timezone.utc).isoformat()
+    p = _resolve_context_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def _deep_merge(base: dict, update: dict) -> dict:
+    for k, v in update.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        elif k in base and isinstance(base[k], list) and isinstance(v, list):
+            base[k].extend(v)
+        else:
+            base[k] = v
+    return base
+
+def _get_program_info() -> tuple[str, str]:
+    """Return (program_name, project_dir) from the running Ghidra instance."""
+    lines = safe_get("programInfo")
+    if len(lines) >= 2 and not lines[0].startswith("Error") and not lines[0].startswith("Request failed"):
+        return lines[0].strip(), lines[1].strip()
+    if len(lines) == 1 and not lines[0].startswith("Error") and not lines[0].startswith("Request failed"):
+        return lines[0].strip(), ""
+    return "", ""
+
+def _resolve_context_path() -> Path:
+    """Derive the context JSON path from the currently loaded Ghidra program.
+
+    Stores the file inside the Ghidra project directory as
+    <project_dir>/<program_name>.context.json.
+    Falls back to ~/.ghidra_mcp/<program_name>.context.json if the project
+    directory is unavailable.
+    """
+    name, project_dir = _get_program_info()
+    if not name:
+        raise RuntimeError("No program loaded in Ghidra")
+    if project_dir:
+        d = Path(project_dir)
+    else:
+        d = Path.home() / ".ghidra_mcp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{name}.context.json"
+
+###############################################################################
 
 @mcp.tool()
 def list_methods(offset: int = 0, limit: int = 100) -> list:
@@ -624,6 +702,158 @@ def create_segment(
         "overlay": "true" if overlay else "false"
     }
     return safe_post("createSegment", params)
+
+###############################################################################
+# Persistent RE context tools
+###############################################################################
+
+@mcp.tool()
+def load_context() -> str:
+    """
+    Load saved reverse-engineering context for the currently loaded binary.
+
+    The context file is stored alongside the Ghidra project. Returns the full
+    JSON state (functions, structs, globals, hypotheses, next_targets,
+    open_threads, dead_ends, session_log). Returns an empty skeleton if no
+    context has been saved yet.
+    """
+    try:
+        ctx = _load_context_file()
+        return json.dumps(ctx, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Error loading context: {e}"
+
+
+@mcp.tool()
+def save_context(context: str | dict) -> str:
+    """
+    Persist full reverse-engineering state to disk (deep-merged with existing).
+
+    The context file is stored alongside the Ghidra project directory.
+    The context parameter is a JSON string whose keys are deep-merged into the
+    existing saved state: dicts are recursively merged, lists are extended,
+    and scalars are overwritten. meta.last_updated and meta.sessions are
+    updated automatically.
+
+    Args:
+        context: JSON string with the state to merge
+                 (e.g. '{"functions": {"main": "entry, sets up heap"}}')
+    """
+    try:
+        update = context if isinstance(context, dict) else json.loads(context)
+    except json.JSONDecodeError as e:
+        return f"Error: invalid JSON — {e}"
+
+    try:
+        existing = _load_context_file()
+        _deep_merge(existing, update)
+        existing["meta"]["sessions"] = existing["meta"].get("sessions", 0) + 1
+        name, _ = _get_program_info()
+        existing["meta"]["binary_name"] = name
+        _save_context_file(existing)
+        return f"Context saved for '{name}' ({_resolve_context_path()})"
+    except Exception as e:
+        return f"Error saving context: {e}"
+
+
+@mcp.tool()
+def update_finding(category: str, key: str, value: str) -> str:
+    """
+    Upsert a single finding into the saved context for the current binary.
+
+    For dict categories (functions, structs, globals):
+        Sets context[category][key] = value.
+    For list categories (hypotheses, next_targets, open_threads, dead_ends,
+    session_log):
+        Appends {"key": key, "value": value, "timestamp": <now>}.
+
+    Args:
+        category: Top-level key in the context schema
+                  (functions | structs | globals | hypotheses | next_targets |
+                   open_threads | dead_ends | session_log)
+        key: The finding key (e.g. function name, struct name, hypothesis label)
+        value: The finding value / description
+    """
+    valid = set(_EMPTY_CONTEXT.keys()) - {"meta"}
+    if category not in valid:
+        return f"Error: category must be one of {sorted(valid)}"
+
+    try:
+        ctx = _load_context_file()
+        target = ctx.get(category)
+
+        if isinstance(target, dict):
+            ctx[category][key] = value
+        elif isinstance(target, list):
+            ctx[category].append({
+                "key": key,
+                "value": value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        else:
+            return f"Error: unexpected type for category '{category}'"
+
+        _save_context_file(ctx)
+        name, _ = _get_program_info()
+        return f"Updated {category}.{key} for '{name}'"
+    except Exception as e:
+        return f"Error updating finding: {e}"
+
+
+@mcp.tool()
+def get_analysis_status() -> str:
+    """
+    Return a concise summary of reverse-engineering progress for the current binary.
+
+    Shows counts of analysed functions, structs, globals, hypotheses,
+    open threads, next targets, dead ends, and the last-updated timestamp.
+    """
+    try:
+        ctx = _load_context_file()
+        meta = ctx.get("meta", {})
+        lines = [
+            f"Binary: {meta.get('binary_name', 'unknown')}",
+            f"Sessions: {meta.get('sessions', 0)}",
+            f"Last updated: {meta.get('last_updated', 'never')}",
+            f"Functions documented: {len(ctx.get('functions', {}))}",
+            f"Structs documented: {len(ctx.get('structs', {}))}",
+            f"Globals documented: {len(ctx.get('globals', {}))}",
+            f"Hypotheses: {len(ctx.get('hypotheses', []))}",
+            f"Open threads: {len(ctx.get('open_threads', []))}",
+            f"Next targets: {len(ctx.get('next_targets', []))}",
+            f"Dead ends: {len(ctx.get('dead_ends', []))}",
+            f"Session log entries: {len(ctx.get('session_log', []))}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting status: {e}"
+
+
+@mcp.tool()
+def set_next_targets(targets: str, notes: str = "") -> str:
+    """
+    Record the next functions/addresses to analyze in future sessions.
+
+    Replaces the current next_targets list with the new set of targets.
+
+    Args:
+        targets: Comma-separated list of function names or addresses
+                 (e.g. "FUN_001234,FUN_005678,process_packet")
+        notes: Optional notes explaining why these targets were chosen
+    """
+    try:
+        ctx = _load_context_file()
+        now = datetime.now(timezone.utc).isoformat()
+        target_list = [t.strip() for t in targets.split(",") if t.strip()]
+        ctx["next_targets"] = [
+            {"target": t, "notes": notes, "timestamp": now} for t in target_list
+        ]
+        _save_context_file(ctx)
+        name, _ = _get_program_info()
+        return f"Set {len(target_list)} next targets for '{name}': {', '.join(target_list)}"
+    except Exception as e:
+        return f"Error setting targets: {e}"
+
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
